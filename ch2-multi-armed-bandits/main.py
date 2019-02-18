@@ -1,8 +1,9 @@
+import numpy as np
 import tensorflow as tf
 import argparse
 
 
-def create_graph(params):
+def create_graph(params, delta_graph):
     tf.reset_default_graph()
 
     arms_count = params.arms
@@ -13,10 +14,9 @@ def create_graph(params):
             'q',
             shape,
             initializer=tf.initializers.random_normal)
-    q_estimated = tf.get_variable(
-            'q_estimated',
-            shape,
-            initializer=tf.zeros_initializer)
+    q_estimated = tf.Variable(
+            np.ones(shape, dtype=np.float32) * params.init_q,
+            name='q_estimated')
     n = tf.get_variable(
             'n',
             shape,
@@ -55,7 +55,8 @@ def create_graph(params):
                 n,
                 tf.cast(mask, tf.int32),
                 name='increment_n')
-        delta = error / tf.cast(inc_n, tf.float32)
+        inc_n = tf.cast(inc_n, tf.float32)
+        delta = delta_graph(params, error, inc_n)
         train_op = tf.assign_add(
                 q_estimated,
                 delta,
@@ -82,8 +83,12 @@ def create_graph(params):
         tf.summary.histogram('true_error', true_error)
         tf.summary.scalar('avg_true_error', tf.reduce_mean(true_error))
 
+        # Error
+        square_error = tf.pow(tf.reduce_sum(error, axis=1), 2, name='square_error')
+        tf.summary.scalar('avg_square_error', tf.reduce_mean(square_error))
+        tf.summary.histogram('square_error', square_error)
+
         tf.summary.histogram('reward', tf.reduce_sum(reward, axis=1))
-        tf.summary.histogram('error', tf.reduce_sum(error, axis=1))
         tf.summary.histogram('delta', tf.reduce_sum(delta, axis=1))
         tf.summary.histogram('q_estimated', q_estimated)
 
@@ -92,9 +97,9 @@ def create_graph(params):
     return summaries, train_op
 
 
-def run_experiment(params):
+def run_experiment(params, optimizer):
 
-    summaries, train_op = create_graph(params)
+    summaries, train_op = create_graph(params, optimizer)
 
     with tf.Session() as sess:
         writer = tf.summary.FileWriter(params.output_dir, sess.graph)
@@ -105,6 +110,20 @@ def run_experiment(params):
             writer.add_summary(summ, global_step=step)
 
         writer.close()
+
+
+def delta_sample_average(params, error, n):
+    return error / n
+
+
+def recency_weighted(params, error, n):
+    return error * params.alpha
+
+
+optimizers = {
+        'sample_average': delta_sample_average,
+        'recency_weighted': delta_sample_average,
+}
 
 
 if __name__ == '__main__':
@@ -125,8 +144,24 @@ if __name__ == '__main__':
                         type=int,
                         default=10,
                         help='Number of bandit arms')
+    parser.add_argument('--optimizer', type=str,
+                        default='sample_average',
+                        nargs='?',
+                        help='''Function for delta Q calculation. Possible
+                        values: sample_average, recency_weighted.''')
+    parser.add_argument('--alpha', type=float,
+                        default=0.1,
+                        nargs='?',
+                        help='Alpha parameter for recency_weighted optimizer')
+    parser.add_argument('--init_q', type=float,
+                        default=0.0,
+                        nargs='?',
+                        help='Initial value of Q')
     parser.add_argument('output_dir', type=str,
                         metavar='output_dir',
                         help='Statistics directory for Tensorboard')
     args = parser.parse_args()
-    run_experiment(args)
+
+    optimizer = optimizers[args.optimizer]
+
+    run_experiment(args, optimizer)
