@@ -1,161 +1,180 @@
-import gym
+
 import numpy as np
-from collections import defaultdict
+import gym
 
-epsilon = 0.01
-
-
-class Task:
-
-    def __init__(self, _id,
-            primitiveAction=None,
-            paramValues=[None],
-            stateTr=lambda state : state,
-            termPredicate=lambda state, params : True):
-        self._id = _id
-
-        # For the composite actions
-        self._actions = []
-        self._paramValues = paramValues
-        self._stateTr = stateTr
-        self._termPredicate = termPredicate
-        self._c = {}  # Completition function: param → state → C
-        for params in self._paramValues:
-            self._c[params] = defaultdict(float)  # state → value
-        self._bindedActions = set()  # Actions with specific param values
-
-        # For the primitive actions
-        self._v = defaultdict(float)  # state → value
-        self._primitiveAction = primitiveAction
-
-    def __iadd__(self, action):
-        self._actions.append(action)
-        for param in action.get_params():
-            self._bindedActions.add((action, param))
-        return self
-
-    def get_params(self):
-        return self._paramValues
-
-    def is_primitive(self):
-        return len(self._actions) == 0
-
-    def get_primitive(self):
-        return self._primitiveAction
-
-    def value(self, state, params):
-        if self.is_primitive():
-            return self._v[state]
-        stateTr = self._stateTr(state)
-        c = self._c[params][stateTr]  # params → state → C
-        bestAction, bestActionParams = self._best_binded_action(state, params)
-        return bestAction.value(state, bestActionParams) + c
+import rl
+from taxi import evaluate, print_best_actions, print_v, print_c, print_q
 
 
-    def policy(self, state, params, greedy):
-        global epsilon
-        assert len(self._actions) > 0, "action {} has no children".format(self._name)
-
-        bestBindedAction = self._best_binded_action(state, params)
-
-        if greedy or np.random.uniform() > epsilon:
-            return bestBindedAction
-
-        bindedActions = self._bindedActions.copy()
-        bindedActions.remove(bestBindedAction)
-        bindedActions = list(bindedActions)
-        assert len(bindedActions) > 0, "Action {} has only one child".format(self._id)
-        randIdx = np.random.choice(len(bindedActions))
-        return bindedActions[randIdx]
-
-    def _best_binded_action(self, state, params):
-        bestBindedAction = None  # tuple action+params
-        bestBindedActionValue = -float('inf')
-
-        for action, actionParams in self._bindedActions:
-            bindedActionValue = action.value(state, actionParams)
-            if bindedActionValue > bestBindedActionValue:
-                bestBindedAction = (action, actionParams)
-                bestBindedActionValue = bindedActionValue
-
-        assert bestBindedAction is not None
-        return bestBindedAction
-
-    def is_done(self, state, params):
-        state = self._stateTr(state)
-        return self._termPredicate(state, params)
+n_episodes = 10000
+max_steps = 200
 
 
-def get_action(stack, state, greedy=False):
-    while True:
-        assert len(stack) > 0
-        task, params = stack[-1]
-        if task.is_done(state, params):
-            stack.pop()
-        else:
-            break
-    while True:
-        task, params = stack[-1]
-        if task.is_primitive():
-            break
-        next_task, next_task_params = task.policy(state, params, greedy)
-        stack.append((next_task, next_task_params))
-    action, _ = stack.pop()  # Primitive action
-    return action.get_primitive(), stack
+# Taxi-v2 specific graph
+def create_graph(env):
+    env = env.unwrapped
+    # Creating graph from bottom to the top
+    target_coords = [(0, 0), (4, 0), (0, 4), (3, 4)]
+
+    # Navigate tasks (parameterized)
+    navigate_tasks = [
+            create_navigate_task(env, target_coord)
+            for target_coord in target_coords
+    ]
+
+    # Dropoff
+    def dropoff_state(state):
+        taxi_y, taxi_x, pass_idx, dest_idx = env.decode(state)
+        return taxi_x, taxi_y, dest_idx
+    dropoff = rl.Task("D", 5, state_tr=dropoff_state)
+
+    # Pickup
+    def pickup_state(state):
+        taxi_y, taxi_x, pass_idx, dest_idx = env.decode(state)
+        return taxi_y, taxi_x, pass_idx
+    pickup = rl.Task("P", 4)
+
+    # Get task
+    def pickup_state(state):
+        taxi_y, taxi_x, pass_idx, dest_idx = env.decode(state)
+        return taxi_x, taxi_y, pass_idx
+
+    def picked_up(state):
+        taxi_x, taxi_y, pass_idx = state
+        return pass_idx == 4
+
+    get = rl.Task("get", state_tr=pickup_state, term_predicate=picked_up)
+    get += pickup
+    for navigate_task in navigate_tasks:
+        get += navigate_task
+
+    # Put task
+    def put_state(state):
+        taxi_y, taxi_x, pass_idx, dest_idx = env.decode(state)
+        return taxi_x, taxi_y, pass_idx, dest_idx
+
+    def taxi_empty(state):
+        taxi_x, taxi_y, pass_idx, dest_idx = state
+        return pass_idx != 4
+
+    put = rl.Task("put", state_tr=put_state, term_predicate=taxi_empty)
+    put += dropoff
+    for navigate_task in navigate_tasks:
+        put += navigate_task
+
+    # Root task
+    # TODO: term_predicate
+    root = rl.Task("root", term_predicate=lambda state: False)
+    root += get
+    root += put
+    return root
 
 
-# Task specific graph
-def create_graph(env, done_fn):
-    south = Task("south", 0)
-    north = Task("north", 1)
-    east = Task("east", 2)
-    west = Task("west", 3)
-    pickup = Task("pickup", 4)
-    dropoff = Task("dropoff", 5)
+def create_navigate_task(env, target_coord):
+    env = env.unwrapped
+    def coord_and_target_state(state):
+        taxi_y, taxi_x, pass_idx, dest_idx = env.decode(state)
+        return taxi_x, taxi_y, target_coord[0], target_coord[1]
+    # Creating graph from bottom to the top
+    south = rl.Task("↓", 0, state_tr=coord_and_target_state)
+    north = rl.Task("↑", 1, state_tr=coord_and_target_state)
+    east = rl.Task("→", 2, state_tr=coord_and_target_state)
+    west = rl.Task("←", 3, state_tr=coord_and_target_state)
 
-    def navigateTerminated(state, params):
-        taxi_x, taxi_y = state
-        x, y = params
-        return x == taxi_x and y == taxi_y
-
-    def navigateState(state):
+    # Navigate task
+    def coord_state(state):
         taxi_y, taxi_x, pass_idx, dest_idx = env.decode(state)
         return taxi_x, taxi_y
-    gridCoords = [(x, y) for x in range(5) for y in range(5)]
-    navigate = Task("navigate",
-            paramValues=gridCoords,
-            stateTr=navigateState,
-            termPredicate=navigateTerminated)
+
+    def reached_target(state):
+        taxi_x, taxi_y = state
+        x, y = target_coord
+        return x == taxi_x and y == taxi_y
+
+    navigate = rl.Task(
+            "navigate",
+            params=target_coord,
+            state_tr=coord_state,
+            term_predicate=reached_target)
     navigate += north
     navigate += south
     navigate += east
     navigate += west
 
-    get = Task("get")
-    get += pickup
-    get += navigate
-
-    put = Task("put")
-    put += dropoff
-    put += navigate
-
-    root = Task("root", termPredicate=done_fn)
-    root += put
-    root += get
-
-    return root
+    return navigate
 
 
-env = gym.make('Taxi-v2')
-done = False
-root = create_graph(env.unwrapped, lambda state, params : done)
-stack = [(root, None)]
+def train(env, graph=None):
+    global n_episodes
+    global max_steps
 
-state = env.reset()
-for _ in range(10):
+    if graph is None:
+        graph = rl.get_default_graph()
+    assert graph is not None
+
+    optimizer = rl.Optimizer(
+            graph=graph,
+            learning_rate=0.5,
+            discount_factor=1.0,
+            steps=n_episodes)
+    root = graph.root()
+
+    for i in range(n_episodes):
+        state = env.reset()
+        stack = [(root, 0, state)]  # action, ticks, state0
+        step = 0
+
+        try:
+            for _ in range(max_steps):
+                if root.is_done(state):
+                    break
+                k = min(1.0, float(i) / float(n_episodes * 0.33))
+                k = 1.0 - k
+                epsilon = 0.05 * k
+                action, stack = rl.get_action(
+                        graph,
+                        stack,
+                        state,
+                        epsilon=epsilon)
+                next_state, reward, done, debug = env.step(action)
+                optimizer.optimize(i, stack, next_state, done)
+                state = next_state
+                step += 1
+                if done:
+                    break
+        except KeyError as error:
+            print('episode {}, step {}'.format(i, step))
+            print('state: {}', list(env.unwrapped.decode(state)))
+            env.render()
+            rl.print_stack(stack)
+            raise error
+
+        print("{} solved in {} steps".format(i, step))
     env.render()
-    action, stack = get_action(stack, state)
-    state, reward, done, debug = env.step(action)
-    env.render()
+    print('== best_action ==')
+    print_best_actions(env.unwrapped, graph)
+    print('== V ==')
+    print_v(env.unwrapped, graph, root)
+    for sub_task in root.get_actions():
+        print('== Q({}) =='.format(sub_task.name))
+        print_q(env.unwrapped, graph, root, sub_task)
+        print('== C({}) =='.format(sub_task.name))
+        print_c(env.unwrapped, graph, root, sub_task)
+    print('C map size: {}'.format(len(graph._c)))
+    # for k, v in graph._c.items():
+        # print(k, v)
+    print('V map size: {}'.format(len(graph._v)))
+    # for k, v in graph._v.items():
+        # print(k, v)
 
-env.close()
+
+if __name__ == '__main__':
+    env = gym.make('Taxi-v2')
+    # target_coord = (3, 4)
+    root = create_graph(env)
+    root = root.get("get")
+
+    graph = rl.Graph(root)
+    train(env, graph=graph)
+    evaluate(env, graph)
+    env.close()
